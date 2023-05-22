@@ -4,6 +4,7 @@ Builds the data modules used to train the policy.
 Sources:
     - RvS GitHub repository (https://github.com/scottemmons/rvs)
     - DT GitHub repository (https://github.com/kzl/decision-transformer)
+    - Edits by Anonymous Authors
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from torch.utils import data
 
 from wt import step, util
 
-max_num_workers = 8
+max_num_workers = 16
+
 
 def create_data_module(
     env: gym.Env,
@@ -36,12 +38,13 @@ def create_data_module(
     reward_conditioning: bool = False,
     average_reward_to_go: bool = True,
     seed: Optional[int] = None,
-    goal_conditioned = None,
     K = 20,
+    train_goal_net = False
 ) -> AbstractDataModule:
     """Creates the data module used for training."""
     if unconditional_policy and reward_conditioning:
         raise ValueError("Cannot condition on reward with an unconditional policy.")
+
     if env_name in step.d4rl_env_names:
         if unconditional_policy:
             data_module = D4RLBCDataModule(
@@ -55,16 +58,19 @@ def create_data_module(
                 env,
                 batch_size=batch_size,
                 val_frac=val_frac,
+                average_reward_to_go=average_reward_to_go,
                 seed=seed,
+                train_goal_net = train_goal_net,
+                K = K
             )
         else:
             data_module = D4RLRvSGDataModule(
                 env,
                 batch_size=batch_size,
                 seed=seed,
+                train_goal_net = train_goal_net,
                 val_frac=val_frac,
-                K = K,
-                goal_conditioned = goal_conditioned
+                K = K
             )
     else:
         if unconditional_policy:
@@ -173,17 +179,20 @@ class D4RLIterableDataset(data.IterableDataset):
                 observation_space for the goal conditioning.
         """
         super().__init__()
+
         self.trajectories = trajectories
         self.lengths = np.array([len(self.trajectories[i]['observations']) for i in range(len(trajectories))])
-        self.rewards = np.array([sum(self.trajectories[i]['rewards']) for i in range(len(trajectories))])
-        self.normalization_const = round(self.rewards.max(), -3)
-        print("Normalization constant:", self.normalization_const)
         self.epoch_size = epoch_size
         self.index_batch_size = index_batch_size
         self.goal_columns = goal_columns
         self.augment = augment
         self.config = config if config is not None else defaultdict(bool)
         self.config.update(kwargs)
+        self.lengths = np.array([len(self.trajectories[i]['observations']) for i in range(len(trajectories))])
+        self.rewards = np.array([sum(self.trajectories[i]['rewards']) for i in range(len(trajectories))])
+        self.normalization_const = round(self.rewards.max(), -3)
+        print("Normalization constant:", self.normalization_const)
+
 
     def _sample_indices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         # Credit to Dibya Ghosh's GCSL codebase for the logic in the following block:
@@ -217,22 +226,16 @@ class D4RLIterableDataset(data.IterableDataset):
         state_dim, act_dim = self.trajectories[0]['observations'].shape[-1], self.trajectories[0]['actions'].shape[-1]
         goal_dim = len(self.goal_columns) if self.goal_columns else state_dim
         # state_mean, state_std = self.config['state_mean'], self.config['state_std']
-        trajectory_indices = range(len(self.trajectories))
         trajs = [self.trajectories[i] for i in trajectory_indices]
         s, a, r, d, rtg, timesteps, mask, g = [], [], [], [], [], [], [], []
-        if os.environ.get('AVG_REWARD') or os.environ.get('CM_REWARD'):
-            rtg_dim = 1
-        else:
-            rtg_dim = 2
         for (si, gi), traj in zip(zip(start_indices, goal_indices), trajs):
             # get sequences from dataset
-            si = 0
             s.append(traj['observations'][si:si + K].reshape(1, -1, state_dim))
             a.append(traj['actions'][si:si + K].reshape(1, -1, act_dim))
-            if self.config['goal_conditioned'] == 'goal':
+            if self.config['goal_conditioned']:
                 g.append(np.hstack([traj['observations'][gi, self.goal_columns].reshape(1, -1, goal_dim)] * s[-1].shape[1]))
-            else:
-                rtg.append(discount_cumsum(traj['rewards'][si:], normalize = self.normalization_const, trim = s[-1].shape[1]).reshape(1, -1, rtg_dim))
+            elif self.config['reward_conditioned']:
+                rtg.append(discount_cumsum(traj['rewards'][si:], normalize = self.normalization_const, trim = s[-1].shape[1]).reshape(1, -1, 2))
 
             # padding and state + reward normalization
             tlen = s[-1].shape[1]
@@ -241,32 +244,31 @@ class D4RLIterableDataset(data.IterableDataset):
             s[-1] = np.concatenate([np.zeros((1, K - tlen, state_dim)), s[-1]], axis=1)
             # s[-1] = (s[-1] - state_mean) / state_std
             a[-1] = np.concatenate([np.ones((1, K - tlen, act_dim)) * -10., a[-1]], axis=1)
-            if self.config['goal_conditioned'] == 'goal':
+            if self.config['goal_conditioned']:
                 # g[-1] = (g[-1] - state_mean[:goal_dim]) / state_std[:goal_dim]
                 g[-1] = np.concatenate([np.zeros((1, K - tlen, goal_dim)), g[-1]], axis=1)
-            else:
-                rtg[-1] = np.concatenate([np.zeros((1, K - tlen, rtg_dim)), rtg[-1]], axis=1) #/ scale
+            elif self.config['reward_conditioned']:
+                rtg[-1] = np.concatenate([np.zeros((1, K - tlen, 2)), rtg[-1]], axis=1) #/ scale
             mask.append(np.concatenate([np.zeros((1, K - tlen)), np.ones((1, tlen))], axis=1))
 
         s = torch.from_numpy(np.concatenate(s, axis=0)).to(dtype=torch.float32)
         a = torch.from_numpy(np.concatenate(a, axis=0)).to(dtype=torch.float32)
-        if self.config['goal_conditioned'] == 'goal':
+
+        if self.config['goal_conditioned']:
             g = torch.from_numpy(np.concatenate(g, axis=0)).to(dtype=torch.float32)
-        else:
+        elif self.config['reward_conditioned']:
             rtg = torch.from_numpy(np.concatenate(rtg, axis=0)).to(dtype=torch.float32, )
-            # idx = np.concatenate(mask, axis=0).argmax(axis = 1)
-            # baseline = np.repeat(idx[..., None], rtg.shape[1], axis = 1)
-            # repeats = np.repeat(np.arange(rtg.shape[1])[None] // 30 * 30, rtg.shape[0], axis = 0)
-            # artg = rtg[np.repeat(np.arange(rtg.shape[0])[..., None], rtg.shape[1], axis = 1), np.maximum(baseline, repeats)]
-            artg = rtg[:, 0]
+            artg = rtg[:, 0:1]
             artg = artg.repeat(1, s.shape[1], 1)
+ 
         mask = torch.from_numpy(np.concatenate(mask, axis=0))
-        if self.config['goal_conditioned'] == 'goal':
+
+        if self.config['goal_conditioned']:
             return s, a, g, mask
-        elif self.config['goal_conditioned'] == 'reward':
-            # artg = torch.from_numpy(self.rewards[trajectory_indices] / self.lengths[trajectory_indices]).to(dtype=torch.float32)
+        elif self.config['reward_conditioned'] and self.config.get('train_goal_net'):
             return s, rtg, artg, mask
-        return s, a, artg, mask
+        else:
+            return s, a, artg, mask
 
     def _sample_batch(self, batch_size = None) -> Tuple:
         trajectory_indices, start_indices, goal_indices = self._sample_indices()
@@ -298,7 +300,6 @@ def discount_cumsum(x, normalize = 1, trim = 1e8):
     elif os.environ.get('CM_REWARD'):
         return norm
     return np.vstack([avg[None], norm[None]]).T
-    # return np.cumsum(x[::-1])[::-1] / normalize
 
 class AbstractDataModule(pl.LightningDataModule, ABC):
     """Abstract class that serves as parent for all DataModules."""
@@ -363,39 +364,6 @@ class AbstractDataModule(pl.LightningDataModule, ABC):
             worker_init_fn=seed_worker,
         )
 
-
-class GCSLDataModule(AbstractDataModule):
-    """The data module used for GCSL envs."""
-
-    def __init__(
-        self,
-        rollout_directory: str,
-        batch_size: int = 32,
-        val_frac: float = 0.2,
-        num_workers: Optional[int] = None,
-        seed: Optional[int] = None,
-    ):
-        """Custom initialization for the GCSL data module."""
-        super().__init__(
-            batch_size=batch_size,
-            val_frac=val_frac,
-            num_workers=num_workers,
-            seed=seed,
-        )
-        self.rollout_directory = rollout_directory
-
-    def setup(self, stage: Optional[str] = None) -> None:
-        """Create the training and validation data."""
-        tensor_dataset = load_tensor_dataset(self.rollout_directory)
-        n_val = int(self.val_frac * len(tensor_dataset))
-        n_train = len(tensor_dataset) - n_val
-
-        data_train, data_val = data.random_split(tensor_dataset, [n_train, n_val])
-        if n_val == 0:
-            data_val = None
-
-        if stage == "fit" or stage is None:
-            self.data_train, self.data_val = data_train, data_val
 
 
 def d4rl_trajectory_split(
@@ -510,30 +478,30 @@ class D4RLBCDataModule(D4RLTensorDatasetDataModule):
         return torch.tensor(dataset["observations"])
 
 
-class D4RLRvSRDataModule(AbstractDataModule):
-    """Data module for RvS-G (goal-conditioned) learning in D4RL."""
+class D4RLRvSRDataModule(D4RLTensorDatasetDataModule):
+    """Data module for RvS-R (reward-conditioned) learning in D4RL."""
 
     def __init__(
         self,
         env: offline_env.OfflineEnv,
-        batch_size: int = 32,
+        batch_size: int,
         val_frac: float = 0.1,
         num_workers: Optional[int] = None,
+        average_reward_to_go: bool = True,
         seed: Optional[int] = None,
+        train_goal_net = False,
+        K = 20
     ):
-        """Custom initialization.
-
-        Saves the environment and conditions on the (x, y) coordinate of the goal in
-        AntMaze.
-        """
+        """Custom initialization that sets the average_reward_to_go."""
         super().__init__(
-            batch_size=batch_size,
+            env,
+            batch_size,
             val_frac=val_frac,
             num_workers=num_workers,
             seed=seed,
         )
-        self.env = env
-        self.goal_columns = (0, 1) if step.is_antmaze_env(env) else None
+        self.train_goal_net = train_goal_net
+        self.K = K
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Create the training and validation data."""
@@ -543,18 +511,23 @@ class D4RLRvSRDataModule(AbstractDataModule):
 
         train_dataset = D4RLIterableDataset(
             paths[train_indices],
-            goal_columns=self.goal_columns,
-            K=20,
-            max_ep_len=10000,
-            goal_conditioned=None
+            goal_columns=None,
+            K=self.K,
+            max_ep_len=1000,
+            goal_conditioned=False,
+            reward_conditioned=True,
+            train_goal_net = self.train_goal_net
         )
         val_dataset = (
             D4RLIterableDataset(
                 paths[train_indices],
-                goal_columns=self.goal_columns,
-                K=20,
-                max_ep_len=10000,
-                goal_conditioned=None
+                goal_columns=None, #self.goal_columns,
+                K=self.K,
+                max_ep_len=1000,
+                goal_conditioned=False,
+                reward_conditioned=True,
+                train_goal_net = self.train_goal_net
+
             )
             if self.val_frac > 0
             else None
@@ -579,9 +552,8 @@ class D4RLRvSRDataModule(AbstractDataModule):
             else:
                 done_bool = np.logical_or(dataset["terminals"][i], dataset["timeouts"][i])
 
-            for k in ['observations', 'actions', 'rewards', 'terminals', 'infos/goal']:
-                if k in dataset:
-                    data_[k].append(dataset[k][i])
+            for k in ['observations', 'actions', 'rewards', 'terminals']:
+                data_[k].append(dataset[k][i])
             if done_bool:
                 episode_step = 0
                 episode_data = {}
@@ -591,6 +563,12 @@ class D4RLRvSRDataModule(AbstractDataModule):
                 data_ = collections.defaultdict(list)
             episode_step += 1
         return np.array(paths)
+
+    def _get_observation_tensor(self, dataset: Dict[str, np.ndarray]) -> torch.Tensor:
+        return make_s_g_tensor(
+            dataset["observations"],
+            reward_to_go(dataset, average=self.average_reward_to_go).reshape(-1, 1),
+        )
 
 
 class D4RLRvSGDataModule(AbstractDataModule):
@@ -604,7 +582,7 @@ class D4RLRvSGDataModule(AbstractDataModule):
         num_workers: Optional[int] = None,
         seed: Optional[int] = None,
         K = 20,
-        goal_conditioned = 'goal'
+        train_goal_net = False
     ):
         """Custom initialization.
 
@@ -618,9 +596,9 @@ class D4RLRvSGDataModule(AbstractDataModule):
             seed=seed,
         )
         self.env = env
-        self.K = K
-        self.goal_conditioned = goal_conditioned
         self.goal_columns = (0, 1) if step.is_antmaze_env(env) else None
+        self.K = K
+        self.train_goal_net = train_goal_net
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Create the training and validation data."""
@@ -632,16 +610,18 @@ class D4RLRvSGDataModule(AbstractDataModule):
             paths[train_indices],
             goal_columns=self.goal_columns,
             K=self.K,
-            max_ep_len=5000,
-            goal_conditioned=self.goal_conditioned
+            max_ep_len=1000,
+            goal_conditioned=True,
+            reward_conditioned=False
         )
         val_dataset = (
             D4RLIterableDataset(
                 paths[train_indices],
                 goal_columns=self.goal_columns,
                 K=self.K,
-                max_ep_len=5000,
-                goal_conditioned=self.goal_conditioned
+                max_ep_len=1000,
+                goal_conditioned=True,
+                reward_conditioned=False
             )
             if self.val_frac > 0
             else None
@@ -666,9 +646,8 @@ class D4RLRvSGDataModule(AbstractDataModule):
             else:
                 done_bool = np.logical_or(dataset["terminals"][i], dataset["timeouts"][i])
 
-            for k in ['observations', 'actions', 'rewards', 'terminals', 'infos/goal']:
-                if k in dataset:
-                    data_[k].append(dataset[k][i])
+            for k in ['observations', 'actions', 'rewards', 'terminals']:
+                data_[k].append(dataset[k][i])
             if done_bool:
                 episode_step = 0
                 episode_data = {}

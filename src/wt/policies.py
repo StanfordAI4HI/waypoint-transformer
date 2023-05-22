@@ -2,6 +2,7 @@
 Defines the policy class, including the main training step logic.
 
 Source: RvS GitHub repository (https://github.com/scottemmons/rvs)
+Edits by Anonymous Authors
 """
 
 from typing import Optional, Tuple, Type, List
@@ -51,7 +52,7 @@ def make_obs_goal_space(
     if unconditional_policy:
         return observation_space
     elif reward_conditioning:
-        if os.environ.get('AVG_REWARD') or os.environ.get('CM_REWARD'):
+        if os.environ.get('CM_REWARD') or os.environ.get('AVG_REWARD'):
             return util.add_scalar_to_space(observation_space)
         return util.add_scalar_to_space(util.add_scalar_to_space(observation_space))
     elif xy_conditioning:
@@ -181,8 +182,7 @@ class RvS(pl.LightningModule):
         batch_idx: int,
     ) -> torch.Tensor:
         """Computes loss for a validation batch."""
-        with torch.no_grad():
-            loss = self.training_step(batch, batch_idx, log_prefix="val")
+        loss = self.training_step(batch, batch_idx, log_prefix="val")
         return loss
 
     def configure_optimizers(self) -> optim.Optimizer:
@@ -229,6 +229,7 @@ class RvS(pl.LightningModule):
             deterministic=deterministic,
             actions = np.concatenate([act[np.newaxis, np.newaxis] for act in actions], axis = 1) if actions is not None else actions
         )[-1]
+
 
     def get_actions(
         self,

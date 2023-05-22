@@ -2,6 +2,7 @@
 Run the training.
 
 Source: RvS GitHub repository (https://github.com/scottemmons/rvs)
+Edits by Anonymous Authors
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from gcsl import envs
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
-import torch
 
 from wt import analyze_d4rl, dataset, policies, step, util, visualize, goal_net
 
@@ -70,10 +70,10 @@ def run_training(
     batch_size: int,
     val_frac: float,
     use_gpu: bool,
-    train_goal_net: bool,
-    goal_net_k: int
+    train_goal_net: bool = False
 ) -> None:
     """Run the training with PyTorch Lightning and log to Weights & Biases."""
+    reward_conditioning = True if 'antmaze' not in env_name and 'kitchen' not in env_name else False
     if not train_goal_net:
         model = policies.RvS(
             env.observation_space,
@@ -88,19 +88,15 @@ def run_training(
             env_name=env_name,
         )
     else:
-        is_goal = ('kitchen' in env_name or 'maze' in env_name)
-        is_antmaze = 'antmaze' in env_name
-        goal_dim = (2 if is_antmaze else env.observation_space.shape[-1]) if is_goal else 2
         model = goal_net.KForwardGoalNetwork(
                     obs_dim = env.observation_space.shape[-1],
-                    goal_dim = goal_dim,
+                    goal_dim = 2 if reward_conditioning else (env.observation_space.shape[-1] if 'antmaze' not in env_name else 2),
                     hidden_dim = hidden_size,
                     learning_rate=learning_rate,
                     batch_size=batch_size,
-                    max_T = goal_net_k,
-                    reward = not is_goal
+                    max_T = 30,
+                    reward = reward_conditioning
                 )
-        print(is_goal, is_antmaze, goal_dim)
     wandb_logger.watch(model, log="all")
 
     monitor = "val_loss" if val_frac > 0 else "train_loss"
@@ -131,6 +127,7 @@ def run_training(
         max_steps=max_steps,
         max_time=train_time,
         logger=wandb_logger,
+        progress_bar_refresh_rate=20,
         callbacks=[periodic_checkpoint_callback, val_checkpoint_callback],
         track_grad_norm=-1,  # logs the 2-norm of gradients
         limit_val_batches=1.0 if val_frac > 0 else 0,
@@ -147,9 +144,23 @@ def run_training(
         reward_conditioning=reward_conditioning,
         average_reward_to_go=not cumulative_reward_to_go,
         seed=seed,
-        K = goal_net_K + 10 if train_goal_net else 20,
-        goal_conditioned = 'reward' if train_goal_net and not is_goal else 'goal'
+        train_goal_net = train_goal_net,
+        K = 40 if train_goal_net else 20
     )
+    """
+    else:
+        data_module = dataset.create_goal_data_module(
+            env,
+            env_name,
+            rollout_directory,
+            batch_size=batch_size,
+            val_frac=val_frac,
+            unconditional_policy=unconditional_policy,
+            reward_conditioning=reward_conditioning,
+            average_reward_to_go=not cumulative_reward_to_go,
+            seed=seed,
+        )
+    """
 
     trainer.fit(model, data_module)
 
@@ -365,12 +376,6 @@ if __name__ == "__main__":
         help="pass --train_goal_net to train goal network",
     )
     parser.add_argument(
-        "--goal_net_k",
-        default=30,
-        type=int,
-        help="pass --goal_net_K to change the goal step for the goal network",
-    )
-    parser.add_argument(
         "--d4rl_analysis",
         default="all",
         type=str,
@@ -448,8 +453,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         val_frac=args.val_frac,
         use_gpu=args.use_gpu,
-        train_goal_net=args.train_goal_net,
-        goal_net_k = args.goal_net_k
+        train_goal_net=args.train_goal_net
     )
     if args.visualize:
         visualize.visualize_performance(

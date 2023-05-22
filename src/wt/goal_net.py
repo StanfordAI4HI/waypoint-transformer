@@ -1,3 +1,9 @@
+"""
+Goal and reward waypoint network implementation.
+
+By Anonymous Authors
+"""
+
 import gym
 from gym import spaces
 import numpy as np
@@ -8,35 +14,10 @@ from torch.nn import functional as F
 
 from wt import dataset, layers, step, util
 
-class ManualGoalNetwork(nn.Module):
-    LARGE_GOALS = torch.tensor([[12, 0], [12, 7], [0, 7], [4, 15], [0, 22], [20, 7], [20, 15], [20, 22], [12, 22], [12, 15], [20, 0], 
-                                [28, 0], [28, 7], [36, 0], [36, 7], [36, 15], [28, 15], [28, 22], [36, 24]])
-
-    LARGE_GOALS = torch.tensor([[0, 8], [12, 7], [20, 7], [20, 15], [28, 15], [28, 24], [36, 24]])
-
-    def __init__(self, obs_dim, goal_dim, level = 'large', **unused):
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.goal_dim = goal_dim
-        self.dummy_param = nn.Parameter(torch.zeros(1))
-        if level == 'large':
-            self.goals = ManualGoalNetwork.LARGE_GOALS.to(self.dummy_param.device)
-        
-    def forward(self, obs_goal):
-        loc, global_goals = obs_goal[..., :self.goal_dim], obs_goal[..., -self.goal_dim:]
-        goal_dist = torch.linalg.norm(loc.unsqueeze(-2) - self.goals.unsqueeze(0), dim = -1)
-        sorted_idx = goal_dist.argsort(dim = -1)
-        global_prox_cond = torch.linalg.norm(self.goals[sorted_idx] - global_goals.unsqueeze(-2), dim = -1) < torch.linalg.norm(loc - global_goals, dim = -1).unsqueeze(-1)
-        selected = global_prox_cond.int().argmax(dim = -1)
-        return self.goals[selected]
-
 class KForwardGoalNetwork(pl.LightningModule):
     def __init__(self, obs_dim, goal_dim, hidden_dim, max_T, recurrent = False,
-                learning_rate=1e-3, batch_size=1024, reward = False,
-                sample_k = False):
+                learning_rate=1e-3, batch_size=1024, reward = False):
         super().__init__()
-        if reward:
-            assert goal_dim == 2
         self.recurrent = recurrent 
         self.learning_rate = learning_rate
         self.batch_size = batch_size
@@ -45,39 +26,19 @@ class KForwardGoalNetwork(pl.LightningModule):
         self.max_T = max_T
         self.reward = reward
 
-        if self.recurrent:
-            self.net = nn.GRUCell(input_size = obs_dim + goal_dim, hidden_size = hidden_dim)
-            self.goal_net = nn.Linear(hidden_dim + goal_dim, goal_dim)
-        else:
-            self.net = nn.Sequential(nn.Linear(obs_dim + goal_dim, hidden_dim),
-                                     nn.ReLU(),
-                                     nn.Linear(hidden_dim, hidden_dim),
-                                     nn.ReLU(),
-                                     nn.Linear(hidden_dim, hidden_dim),
-                                     nn.ReLU(),
-                                     nn.Linear(hidden_dim, hidden_dim),
-                                     nn.ReLU(),
-                                     nn.Linear(hidden_dim, goal_dim))
+        if self.reward:
+            assert goal_dim == 2
+        self.net = nn.Sequential(nn.Linear(obs_dim + goal_dim, hidden_dim),
+                                 nn.ReLU(),
+                                 nn.Linear(hidden_dim, hidden_dim),
+                                 nn.ReLU(),
+                                 nn.Linear(hidden_dim, hidden_dim),
+                                 nn.ReLU(),
+                                 nn.Linear(hidden_dim, hidden_dim),
+                                 nn.ReLU(),
+                                 nn.Linear(hidden_dim, goal_dim))
 
     def forward(self, obs_goal):
-        """
-        if self.recurrent:
-            all_outputs = []
-            hidden_state = torch.zeros((obs.shape[0], self.hidden_dim)).cuda()
-            goal = obs[..., :self.goal_dim]
-            for _ in range(max(T) + 1):
-                all_outputs.append(goal.unsqueeze(0))
-                hidden_state = self.net(torch.cat([obs, goal], dim = -1), hidden_state)
-                goal = goal + self.goal_net(torch.cat([hidden_state, goal], dim = -1))
-            all_outputs = torch.cat(all_outputs, dim = 0)
-            ret = []
-            for i, t in enumerate(T):
-                ret.append(all_outputs[t, i].unsqueeze(0))
-            return torch.cat(ret, dim = 0)
-        else:
-            inp = self.embd(T) + torch.cat([obs, goal], dim = -1)
-            return self.net(inp)
-        """
         if self.reward:
             return obs_goal[..., -self.goal_dim:] + self.net(obs_goal)
 
@@ -118,6 +79,45 @@ class KForwardGoalNetwork(pl.LightningModule):
         """Configures the optimizer used by PyTorch Lightning."""
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
+
+class Manager:
+    def __init__(self, global_goal, epsilon = 0.01, K = 20, goal_columns = (0, 1)):
+        self.global_goal = global_goal
+        self.goal_columns = goal_columns
+        self.epsilon, self.K = epsilon, K
+        self._observations = []
+        self._actions = []
+
+    def update_obs(self, obs):
+        self._observations.append(obs)
+        self._observations = self._observations[-self.K:]
+
+    def update_act(self, act):
+        self._actions.append(act)
+        self._actions = self._actions[-self.K + 1:]
+
+    @property
+    def goal(self):
+        if self._stuttering(self._observations):
+            return self.global_goal #proposed_goal.detach().numpy()[0]
+        return self.global_goal
+        
+    @property
+    def actions(self):
+        return None if not self._actions else self._actions + [np.zeros_like(self._actions[-1])]
+
+    @property
+    def observations(self):
+        if self._stuttering(self._observations):
+            return self._observations# [-1:]
+        return self._observations
+
+    def _stuttering(self, observations):
+        if len(observations) < self.K:
+            return False
+        observations = np.concatenate([o[None, self.goal_columns] for o in observations], axis = 0)
+        velocity = np.linalg.norm(observations[1:] - observations[:-1], axis = -1)
+        return np.mean(velocity) <= self.epsilon
 
 class Manager:
     def __init__(self, global_goal, epsilon = 0.01, K = 20, goal_columns = (0, 1), goal_append = False):
@@ -175,3 +175,27 @@ class Manager:
         observations = np.concatenate([o[None, self.goal_columns] for o in observations], axis = 0)
         velocity = np.linalg.norm(observations[1:] - observations[:-1], axis = -1)
         return np.mean(velocity) <= self.epsilon
+
+class ManualGoalNetwork(nn.Module):
+    LARGE_GOALS = torch.tensor([[12, 0], [12, 7], [0, 7], [4, 15], [0, 22], [20, 7], [20, 15], [20, 22], [12, 22], [12, 15], [20, 0],
+                                [28, 0], [28, 7], [36, 0], [36, 7], [36, 15], [28, 15], [28, 22], [36, 24]])
+
+    # LARGE_GOALS = torch.tensor([[0, 8], [12, 7], [20, 7], [20, 15], [28, 15], [28, 24], [36, 24]])
+
+    def __init__(self, obs_dim, goal_dim, level = 'large', **unused):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.goal_dim = goal_dim
+        self.dummy_param = nn.Parameter(torch.zeros(1))
+        if level == 'large':
+            self.goals = ManualGoalNetwork.LARGE_GOALS.to(self.dummy_param.device)
+
+    def forward(self, obs_goal):
+        self.goals = self.goals.to(obs_goal.device)
+        loc, global_goals = obs_goal[..., :self.goal_dim], obs_goal[..., -self.goal_dim:]
+        goal_dist = torch.linalg.norm(loc.unsqueeze(-2) - self.goals.unsqueeze(0), dim = -1)
+        sorted_idx = goal_dist.argsort(dim = -1)
+        global_prox_cond = torch.linalg.norm(self.goals[sorted_idx] - global_goals.unsqueeze(-2), dim = -1) < torch.linalg.norm(loc - global_goals, dim = -1).unsqueeze(-1)
+        selected = global_prox_cond.int().argmax(dim = -1)
+        return self.goals[selected]
+

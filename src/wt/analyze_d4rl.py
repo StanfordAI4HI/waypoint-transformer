@@ -37,20 +37,26 @@ def run_reward_conditioning(
     """Evaluate the policies for various reward fractions, and visualize the results."""
     print(env.unwrapped.spec.id)
     if 'hopper' in env.unwrapped.spec.id:
-        if 'medium-replay' in env.unwrapped.spec.id:
+        if 'medium-expert' in env.unwrapped.spec.id:
+            # reward_fractions = [0.95, 0.975, 1.0, 1.05, 1.075, 1.1, 1.15]
+            reward_fractions = [1.175, 1.2, 1.225, 1.25]
+        elif 'medium-replay' in env.unwrapped.spec.id:
             # reward_fractions = [0.925, 0.8, 0.85, 0.9, 0.95, 0.975, 1., 1.025] #[0.55, 0.575, 0.59, 0.6, 0.625, 0.65]
             reward_fractions = [0.95]
         else:
             # reward_fractions = [0.9, 0.95, 0.975, 1., 1.025, 1.05, 1.075, 1.1, 1.125, 1.15, 1.175] #[0.55, 0.575, 0.59, 0.6, 0.625, 0.65]
             reward_fractions = [1., 1.025, 1.05, 1.075, 0.975]
     elif 'cheetah' in env.unwrapped.spec.id:
-        if 'medium-replay' in env.unwrapped.spec.id:
+        if 'medium-expert' in env.unwrapped.spec.id:
+            reward_fractions = [0.9, 0.925, 0.95, 0.975, 1.0, 1.025, 1.05, 1.075, 1.1]
+        elif 'medium-replay' in env.unwrapped.spec.id:
             reward_fractions = [0.425, 0.45, 0.475, 0.5, 0.525, 0.375, 0.4]
         else:
             reward_fractions = [0.425, 0.45, 0.475, 0.5, 0.525, 0.55, 0.575, 0.6]
     elif 'walker' in env.unwrapped.spec.id:
         if 'medium-expert' in env.unwrapped.spec.id:
-            reward_fractions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+            #reward_fractions = [0.95, 0.975, 1.0, 1.05, 1.075, 1.1, 1.15]
+            reward_fractions = [1.175, 1.20, 1.225, 1.25]
         elif 'medium-replay' in env.unwrapped.spec.id:
             # reward_fractions = [0.675, 0.7, 0.725, 0.75, 0.775, 0.8, 0.825, 0.85]
             reward_fractions = [0.7, 0.725, 0.75, 0.775, 0.85, 0.8, 0.825, 0.85, 0.875, 0.9, 0.925, 0.95] #no goalnet

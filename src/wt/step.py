@@ -2,6 +2,7 @@
 Methods for interacting with the environments.
 
 Source: RvS GitHub repository (https://github.com/scottemmons/rvs)
+Edits by Anonymous Authors
 """
 
 from __future__ import annotations
@@ -404,14 +405,14 @@ def sample_cumulative_reward(
             else get_dynamic_kitchen_goal(env, observation)
         )
         if 'hopper' in env.unwrapped.spec.id:
-            normalizer = 3000
-            if 'medium-replay' in env.unwrapped.spec.id:
-                goal = np.array([goal[0], goal[0] * 1000 / 3000])
+            normalizer = 4000 if 'medium-expert' in env.unwrapped.spec.id else 3000
+            if 'medium-replay' in env.unwrapped.spec.id or 'medium-expert' in env.unwrapped.spec.id:
+                goal = np.array([goal[0], goal[0] * 1000 / normalizer])
             else:
                 goal = np.array([goal[0], 2200 / 3000])
         elif 'cheetah' in env.unwrapped.spec.id:
-            normalizer = 5000
-            goal = np.array([goal[0], goal[0] * 1000 / 5000]) 
+            normalizer = 11000 if 'medium-expert' in env.unwrapped.spec.id else 5000
+            goal = np.array([goal[0], goal[0] * 1000 / normalizer]) 
         elif 'walker' in env.unwrapped.spec.id:
             if 'medium-expert' in env.unwrapped.spec.id:
                 normalizer = 5000
